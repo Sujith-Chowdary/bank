@@ -119,12 +119,6 @@ on GitHub Codespaces and on a local machine with Docker/Compose installed.
    - Place raw batch files in `Data/raw/`.
    - Airflow writes split outputs to `Data/good_data/` and `Data/bad_data/`.
 
-5. Where scheduled predictions are stored:
-   - The prediction DAG reads only from `Data/good_data/` and posts each chunk to the FastAPI `/predict` endpoint with
-     metadata about the source file.
-   - FastAPI persists the predictions (with `source="scheduled"` and the originating filename in `source_file`) to the
-     `predictions` table in the PostgreSQL database. You can query them via `/past-predictions` or directly from the DB.
-
 #### Codespaces-specific notes
 
 - Open a new terminal in your Codespace and run `docker-compose up --build`; Codespaces exposes the forwarded ports in the “Ports”
@@ -166,14 +160,9 @@ If you prefer to run services individually (for development/debugging):
    airflow webserver & airflow scheduler
    ```
 
- This setup keeps all components running together so you can exercise the ingestion and prediction DAGs alongside the API and UI.
+This setup keeps all components running together so you can exercise the ingestion and prediction DAGs alongside the API and UI.
 
-### Generating ingestion test data
-
-- To split the base dataset into multiple raw files, run `python Data/data_gen_split.py --dataset_path Data/raw_dataset.csv --raw_data_dir Data/raw --num_files 6`.
-- To deliberately create at least seven error types for demoing the ingestion DAG, open `notebooks/data_quality_issue_generator.ipynb` and run the cells. They will materialize CSVs (missing columns, missing values, unknown categories, out-of-bounds numerics, non-numeric entries, invalid booleans, duplicate rows) into `Data/raw/` for validation.
-
- **6. Results & Insights**
+**6. Results & Insights**
     •	Random Forest model predicts churn with high accuracy.
     •	Most important features:
           o	Credit Score
