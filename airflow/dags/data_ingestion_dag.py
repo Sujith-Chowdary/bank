@@ -236,6 +236,9 @@ def send_alerts(**context):
         except Exception as exc:
             print(f"Failed to send Teams notification: {exc}")
 
+    picked_file = random.choice(files)
+    context["ti"].xcom_push(key="picked_file", value=str(picked_file))
+    return str(picked_file)
 
 def split_and_save_data(**context):
     result_path = context["ti"].xcom_pull(key="validation_result_path")
