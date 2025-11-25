@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -17,13 +16,6 @@ from airflow.utils.dates import days_ago
 from airflow.utils.trigger_rule import TriggerRule
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
-DATABASE_DIR = ROOT_DIR / "database"
-if DATABASE_DIR.exists() and str(DATABASE_DIR) not in sys.path:
-    sys.path.append(str(DATABASE_DIR))
 
 from database.db import Base, DataQualityIssue, IngestionStatistic
 
