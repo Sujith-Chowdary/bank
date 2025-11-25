@@ -1,101 +1,367 @@
+from __future__ import annotations
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from datetime import datetime, timedelta
-import os, random, shutil
-from airflow.utils.dates import days_ago
+import json
+import os
+import random
+import sys
+from datetime import timedelta
+from pathlib import Path
+from typing import Dict, List
+
 import pandas as pd
+import requests
+from airflow import DAG
+from airflow.exceptions import AirflowSkipException
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.utils.trigger_rule import TriggerRule
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+DATABASE_DIR = ROOT_DIR / "database"
+if DATABASE_DIR.exists() and str(DATABASE_DIR) not in sys.path:
+    sys.path.append(str(DATABASE_DIR))
 
-DATA_DIR = "/opt/airflow/Data"
-FULL_DATASET = os.path.join(DATA_DIR, "raw_dataset.csv")
-RAW_DIR = os.path.join(DATA_DIR, "raw")
-GOOD_DIR = os.path.join(DATA_DIR, "good_data")
-BAD_DIR = os.path.join(DATA_DIR, "bad_data")
+from database.db import Base, DataQualityIssue, IngestionStatistic
 
-default_args = {
-    "owner": "team",
-    "depends_on_past": False,
-    "retries": 0,
-    "retry_delay": timedelta(minutes=1),
+DATA_DIR = Path(os.getenv("DATA_DIR", "/opt/airflow/Data"))
+RAW_DIR = Path(os.getenv("RAW_DATA_DIR", DATA_DIR / "raw"))
+FALLBACK_RAW_DIR = Path(os.getenv("FALLBACK_RAW_DIR", DATA_DIR))
+GOOD_DIR = Path(os.getenv("GOOD_DATA_DIR", DATA_DIR / "good_data"))
+BAD_DIR = Path(os.getenv("BAD_DATA_DIR", DATA_DIR / "bad_data"))
+REPORT_DIR = Path(os.getenv("REPORT_DIR", DATA_DIR / "reports"))
+VALIDATION_DIR = Path(
+    os.getenv("VALIDATION_DIR", DATA_DIR / "validation_results")
+)
+try:
+    _raw_chunk = int(os.getenv("INGEST_SPLIT_CHUNK_SIZE", "20"))
+except ValueError:
+    _raw_chunk = 20
+
+SPLIT_CHUNK_SIZE = max(10, min(20, _raw_chunk))
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql+psycopg2://admin:admin@db:5432/defence_db"
+)
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
+
+REQUIRED_COLUMNS = [
+    "RowNumber",
+    "CustomerId",
+    "Surname",
+    "CreditScore",
+    "Geography",
+    "Gender",
+    "Age",
+    "Tenure",
+    "Balance",
+    "NumOfProducts",
+    "HasCrCard",
+    "IsActiveMember",
+    "EstimatedSalary",
+]
+CATEGORICAL_VALUES = {
+    "Geography": {"France", "Spain", "Germany"},
+    "Gender": {"Male", "Female"},
+}
+NUMERIC_BOUNDS = {
+    "CreditScore": (300, 900),
+    "Age": (18, 120),
+    "Tenure": (0, 15),
+    "Balance": (0, None),
+    "NumOfProducts": (1, 4),
+    "EstimatedSalary": (0, None),
 }
 
-with DAG(
-    dag_id="data_ingestion_dag",
-    default_args=default_args,
-    schedule_interval="*/1 * * * *",  # every minute for demo
-    start_date=days_ago(1),
-    catchup=False,
-    tags=["ingestion", "split", "followup1"],
-) as dag:
 
-    # 1️⃣ Run your split script
-    split_task = BashOperator(
-        task_id="split_dataset",
-        bash_command=(
-            f"python {DATA_DIR}/data_gen_split.py "
-            f"--dataset_path {FULL_DATASET} "
-            f"--raw_data_dir {RAW_DIR} "
-            f"--num_files 5"
+def _load_validation(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+def _persist_validation(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
+
+def _detect_errors(df: pd.DataFrame) -> Dict:
+    errors: Dict[str, List[int]] = {
+        "missing_column": [],
+        "missing_value": [],
+        "unknown_category": [],
+        "out_of_bounds": [],
+        "non_numeric": [],
+    }
+    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing_columns:
+        errors["missing_column"] = list(range(len(df)))
+        return errors, missing_columns
+
+    for idx, row in df.iterrows():
+        for col in REQUIRED_COLUMNS:
+            if pd.isna(row[col]):
+                errors["missing_value"].append(idx)
+        for col, allowed in CATEGORICAL_VALUES.items():
+            if col in df.columns and row.get(col) not in allowed:
+                errors["unknown_category"].append(idx)
+        for col, bounds in NUMERIC_BOUNDS.items():
+            if col not in df.columns:
+                continue
+            try:
+                value = float(row[col])
+            except Exception:
+                errors["non_numeric"].append(idx)
+                continue
+            lower, upper = bounds
+            if (lower is not None and value < lower) or (
+                upper is not None and value > upper
+            ):
+                errors["out_of_bounds"].append(idx)
+    return errors, []
+
+
+def _criticality(total_rows: int, invalid_rows: int, missing_columns: List[str]) -> str:
+    if missing_columns or invalid_rows == total_rows:
+        return "high"
+    ratio = invalid_rows / total_rows if total_rows else 0
+    if ratio >= 0.3:
+        return "medium"
+    return "low"
+
+
+def read_data(**context):
+    if not RAW_DIR.exists():
+        raise FileNotFoundError(f"raw-data folder not found: {RAW_DIR}")
+
+    files = list(RAW_DIR.glob("*.csv"))
+    print(f"Discovered {len(files)} raw file(s) in {RAW_DIR.resolve()}")
+
+    # If the dedicated raw folder is empty, fall back to any CSVs placed directly under DATA_DIR
+    if not files:
+        fallback_files = list(FALLBACK_RAW_DIR.glob("*.csv"))
+        print(
+            f"No raw files under {RAW_DIR.resolve()}, "
+            f"found {len(fallback_files)} candidate CSV(s) in {FALLBACK_RAW_DIR.resolve()}"
         )
-    )
+        files = fallback_files
+
+    if not files:
+        raise AirflowSkipException(
+            "No raw files to ingest (populate either RAW_DATA_DIR or FALLBACK_RAW_DIR with .csv files)"
+        )
+
+    picked_file = random.choice(files)
+    context["ti"].xcom_push(key="picked_file", value=str(picked_file))
+    return str(picked_file)
 
 
-    def read_data(**context):
-        if not os.path.exists(RAW_DIR):
-            raise FileNotFoundError(f"raw-data folder not found: {RAW_DIR}")
+def validate_data(**context):
+    picked = context["ti"].xcom_pull(key="picked_file")
+    if not picked:
+        raise AirflowSkipException("No file picked for validation")
 
-        files = [f for f in os.listdir(RAW_DIR) if f.endswith(".csv")]
-        if not files:
-            context['ti'].xcom_push(key="picked_file", value=None)
-            return None
+    file_path = Path(picked)
+    df = pd.read_csv(file_path)
+    errors, missing_columns = _detect_errors(df)
+    invalid_indices = sorted({idx for rows in errors.values() for idx in rows})
+    total_rows = len(df)
+    invalid_rows = len(invalid_indices)
+    valid_rows = max(total_rows - invalid_rows, 0)
+    crit = _criticality(total_rows, invalid_rows, missing_columns)
+    errors_by_type = {k: len(set(v)) for k, v in errors.items() if v}
 
-        picked_file = random.choice(files)
-        full_path = os.path.join(RAW_DIR, picked_file)
-        context['ti'].xcom_push(key="picked_file", value=full_path)
-        print(f"Picked file: {full_path}")
-        return full_path
+    report_path = REPORT_DIR / f"report_{file_path.stem}.html"
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_html = f"""
+    <html><body>
+    <h2>Data validation report for {file_path.name}</h2>
+    <p><strong>Criticality:</strong> {crit}</p>
+    <p><strong>Total rows:</strong> {total_rows} — Valid: {valid_rows} / Invalid: {invalid_rows}</p>
+    <h3>Error summary</h3>
+    <ul>
+        {''.join([f'<li>{err}: {count}</li>' for err, count in errors_by_type.items()]) or '<li>No issues found</li>'}
+    </ul>
+    <h3>Missing columns</h3>
+    <p>{', '.join(missing_columns) if missing_columns else 'None'}</p>
+    </body></html>
+    """
+    report_path.write_text(report_html, encoding="utf-8")
 
-    read_task = PythonOperator(
-        task_id="read_data",
-        python_callable=read_data,
-        provide_context=True
-    )
+    validation_payload = {
+        "file_name": file_path.name,
+        "file_path": str(file_path),
+        "total_rows": total_rows,
+        "valid_rows": valid_rows,
+        "invalid_rows": invalid_rows,
+        "errors_by_type": errors_by_type,
+        "criticality": crit,
+        "invalid_indices": invalid_indices,
+        "missing_columns": missing_columns,
+        "report_path": str(report_path),
+    }
 
-    def validate_and_save(**context):
-        picked = context['ti'].xcom_pull(key="picked_file")
-        if not picked:
-            return "no_file"
-
-        os.makedirs(GOOD_DIR, exist_ok=True)
-        os.makedirs(BAD_DIR, exist_ok=True)
-
-        df = pd.read_csv(picked)
-
-        good_df = df.dropna()
-        bad_df = df[df.isnull().any(axis=1)]
-
-        file_name = os.path.basename(picked)
-
-        if not good_df.empty:
-            good_path = os.path.join(GOOD_DIR, file_name)
-            good_df.to_csv(good_path, index=False)
-            print(f"Saved GOOD data → {good_path}")
-
-        if not bad_df.empty:
-            bad_path = os.path.join(BAD_DIR, f"BAD_{file_name}")
-            bad_df.to_csv(bad_path, index=False)
-            print(f"Saved BAD data → {bad_path}")
-
-        os.remove(picked)
-        return {"good_rows": len(good_df), "bad_rows": len(bad_df)}
-
-    validate_task = PythonOperator(
-        task_id="validate_and_save",
-        python_callable=validate_and_save,
-        provide_context=True
-    )
+    result_path = VALIDATION_DIR / f"validation_{file_path.stem}.json"
+    _persist_validation(result_path, validation_payload)
+    context["ti"].xcom_push(key="validation_result_path", value=str(result_path))
+    return validation_payload
 
 
-    split_task >> read_task >> validate_task
+def save_statistics(**context):
+    result_path = context["ti"].xcom_pull(key="validation_result_path")
+    if not result_path:
+        raise AirflowSkipException("No validation results to persist")
+    result = _load_validation(Path(result_path))
+
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        stat = IngestionStatistic(
+            file_name=result["file_name"],
+            total_rows=result["total_rows"],
+            valid_rows=result["valid_rows"],
+            invalid_rows=result["invalid_rows"],
+            criticality=result["criticality"],
+            report_path=result.get("report_path"),
+        )
+        session.add(stat)
+        session.flush()
+
+        for error_type, count in result.get("errors_by_type", {}).items():
+            session.add(
+                DataQualityIssue(
+                    ingestion_id=stat.id,
+                    error_type=error_type,
+                    occurrences=count,
+                    criticality=result["criticality"],
+                )
+            )
+        session.commit()
+    finally:
+        session.close()
+
+
+def send_alerts(**context):
+    result_path = context["ti"].xcom_pull(key="validation_result_path")
+    if not result_path:
+        raise AirflowSkipException("No validation results for alerting")
+    result = _load_validation(Path(result_path))
+    message = {
+        "text": (
+            f"Data ingestion validation completed for {result['file_name']} — "
+            f"Criticality: {result['criticality']} — "
+            f"Invalid rows: {result['invalid_rows']}/{result['total_rows']}. "
+            f"Report: {result['report_path']}"
+        )
+    }
+    print(f"Teams alert payload: {message}")
+    if TEAMS_WEBHOOK_URL:
+        try:
+            resp = requests.post(TEAMS_WEBHOOK_URL, json=message, timeout=10)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"Failed to send Teams notification: {exc}")
+
+
+def split_and_save_data(**context):
+    result_path = context["ti"].xcom_pull(key="validation_result_path")
+    if not result_path:
+        raise AirflowSkipException("No validation results to split data")
+    result = _load_validation(Path(result_path))
+    file_path = Path(result["file_path"])
+    if not file_path.exists():
+        raise AirflowSkipException(f"File missing for splitting: {file_path}")
+
+    df = pd.read_csv(file_path)
+    invalid_indices = set(result.get("invalid_indices", []))
+    if result.get("missing_columns"):
+        invalid_indices = set(range(len(df)))
+
+    good_rows = [i for i in range(len(df)) if i not in invalid_indices]
+    bad_rows = list(invalid_indices)
+
+    GOOD_DIR.mkdir(parents=True, exist_ok=True)
+    BAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _write_chunks(data: pd.DataFrame, dest_dir: Path, prefix: str) -> None:
+        if data.empty:
+            return
+        base_name = file_path.stem
+        for i, start in enumerate(range(0, len(data), SPLIT_CHUNK_SIZE), start=1):
+            chunk = data.iloc[start : start + SPLIT_CHUNK_SIZE]
+            dest = dest_dir / f"{prefix}{base_name}_part{i}.csv"
+            chunk.to_csv(dest, index=False)
+            print(f"Saved {prefix.rstrip('_')} chunk with {len(chunk)} rows → {dest}")
+
+    if not bad_rows:
+        _write_chunks(df, GOOD_DIR, "GOOD_")
+    elif len(bad_rows) == len(df):
+        _write_chunks(df, BAD_DIR, "BAD_")
+    else:
+        good_df = df.loc[good_rows]
+        bad_df = df.loc[bad_rows]
+        _write_chunks(good_df, GOOD_DIR, "GOOD_")
+        _write_chunks(bad_df, BAD_DIR, "BAD_")
+
+    file_path.unlink(missing_ok=True)
+
+
+def build_dag():
+    default_args = {
+        "owner": "team",
+        "depends_on_past": False,
+        "retries": 0,
+        "retry_delay": timedelta(minutes=1),
+    }
+
+    with DAG(
+        dag_id="data_ingestion_dag",
+        default_args=default_args,
+        schedule_interval="*/1 * * * *",
+        start_date=days_ago(1),
+        catchup=False,
+        tags=["ingestion", "validation"],
+    ) as dag:
+        read_task = PythonOperator(
+            task_id="read_data",
+            python_callable=read_data,
+            provide_context=True,
+        )
+
+        validate_task = PythonOperator(
+            task_id="validate_data",
+            python_callable=validate_data,
+            provide_context=True,
+        )
+
+        save_statistics_task = PythonOperator(
+            task_id="save_statistics",
+            python_callable=save_statistics,
+            provide_context=True,
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+
+        send_alerts_task = PythonOperator(
+            task_id="send_alerts",
+            python_callable=send_alerts,
+            provide_context=True,
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+
+        split_and_save_task = PythonOperator(
+            task_id="split_and_save_data",
+            python_callable=split_and_save_data,
+            provide_context=True,
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+
+        read_task >> validate_task >> [save_statistics_task, send_alerts_task, split_and_save_task]
+
+    return dag
+
+
+dag = build_dag()
