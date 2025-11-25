@@ -119,12 +119,6 @@ on GitHub Codespaces and on a local machine with Docker/Compose installed.
    - Place raw batch files in `Data/raw/`.
    - Airflow writes split outputs to `Data/good_data/` and `Data/bad_data/`.
 
-5. Where scheduled predictions are stored:
-   - The prediction DAG reads only from `Data/good_data/` and posts each chunk to the FastAPI `/predict` endpoint with
-     metadata about the source file.
-   - FastAPI persists the predictions (with `source="scheduled"` and the originating filename in `source_file`) to the
-     `predictions` table in the PostgreSQL database. You can query them via `/past-predictions` or directly from the DB.
-
 #### Codespaces-specific notes
 
 - Open a new terminal in your Codespace and run `docker-compose up --build`; Codespaces exposes the forwarded ports in the “Ports”
