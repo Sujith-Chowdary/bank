@@ -34,6 +34,26 @@ default_args = {
     "depends_on_past": False,
     "retries": 0,
 }
+NUMERIC_BOUNDS = {
+    "CreditScore": (300, 900),
+    "Age": (18, 120),
+    "Tenure": (0, 15),
+    "Balance": (0, None),
+    "NumOfProducts": (1, 4),
+    "EstimatedSalary": (0, None),
+}
+
+
+def _load_validation(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+def _persist_validation(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
 
 
 # -------------------------------------------------------------
@@ -190,8 +210,6 @@ with DAG(
         df = pd.read_csv(validation["file_path"])
         file_name = Path(validation["file_path"]).name
 
-        good_df = df.dropna()
-        bad_df = df[df.isnull().any(axis=1)]
 
         if bad_df.empty:
             good_df.to_csv(GOOD_DIR / file_name, index=False)
