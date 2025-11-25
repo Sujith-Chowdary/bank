@@ -110,6 +110,10 @@ defence/
     •Predictive model with explainable results.
     •Ready for integration in real-world banking environments.
 
+## Course Project Requirements
+
+For the “Data Science in Production” course project, see the full architecture and delivery checklist in [PROJECT_INSTRUCTIONS.md](PROJECT_INSTRUCTIONS.md).
+
 
 
 
