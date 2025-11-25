@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -18,37 +17,14 @@ from airflow.utils.trigger_rule import TriggerRule
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
-DATABASE_DIR = ROOT_DIR / "database"
-if DATABASE_DIR.exists() and str(DATABASE_DIR) not in sys.path:
-    sys.path.append(str(DATABASE_DIR))
-
 from database.db import Base, DataQualityIssue, IngestionStatistic
 
-DAGS_ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", "/opt/airflow/Data"))
-RAW_DIR = Path(os.getenv("RAW_DATA_DIR", DATA_DIR / "raw"))
-FALLBACK_RAW_DIR = Path(os.getenv("FALLBACK_RAW_DIR", DATA_DIR))
-# Additional candidate locations to catch common mount patterns (/opt/airflow/dags/Data, repo Data)
-EXTRA_RAW_DIRS = [
-    DAGS_ROOT / "Data",
-    ROOT_DIR / "Data",
-    ROOT_DIR / "airflow" / "Data",
-]
-GOOD_DIR = Path(os.getenv("GOOD_DATA_DIR", DATA_DIR / "good_data"))
-BAD_DIR = Path(os.getenv("BAD_DATA_DIR", DATA_DIR / "bad_data"))
-REPORT_DIR = Path(os.getenv("REPORT_DIR", DATA_DIR / "reports"))
-VALIDATION_DIR = Path(
-    os.getenv("VALIDATION_DIR", DATA_DIR / "validation_results")
-)
-try:
-    _raw_chunk = int(os.getenv("INGEST_SPLIT_CHUNK_SIZE", "20"))
-except ValueError:
-    _raw_chunk = 20
-
-SPLIT_CHUNK_SIZE = max(10, min(20, _raw_chunk))
+DATA_DIR = Path("/opt/airflow/Data")
+RAW_DIR = DATA_DIR / "raw"
+GOOD_DIR = DATA_DIR / "good_data"
+BAD_DIR = DATA_DIR / "bad_data"
+REPORT_DIR = DATA_DIR / "reports"
+VALIDATION_DIR = DATA_DIR / "validation_results"
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql+psycopg2://admin:admin@db:5432/defence_db"
 )
@@ -140,22 +116,14 @@ def _criticality(total_rows: int, invalid_rows: int, missing_columns: List[str])
 
 
 def read_data(**context):
-    search_paths = [RAW_DIR, FALLBACK_RAW_DIR] + [p for p in EXTRA_RAW_DIRS if p]
-    discovered = []
+    if not RAW_DIR.exists():
+        raise FileNotFoundError(f"raw-data folder not found: {RAW_DIR}")
 
-    for path in search_paths:
-        if not path.exists():
-            continue
-        candidates = list(path.glob("*.csv"))
-        print(f"Scanned {path.resolve()} -> {len(candidates)} file(s)")
-        discovered.extend(candidates)
+    files = list(RAW_DIR.glob("*.csv"))
+    if not files:
+        raise AirflowSkipException("No raw files to ingest")
 
-    if not discovered:
-        raise AirflowSkipException(
-            "No raw files to ingest. Stage .csv files under RAW_DATA_DIR, FALLBACK_RAW_DIR, or Data next to dags."
-        )
-
-    picked_file = random.choice(discovered)
+    picked_file = random.choice(files)
     context["ti"].xcom_push(key="picked_file", value=str(picked_file))
     return str(picked_file)
 
@@ -268,6 +236,9 @@ def send_alerts(**context):
         except Exception as exc:
             print(f"Failed to send Teams notification: {exc}")
 
+    picked_file = random.choice(files)
+    context["ti"].xcom_push(key="picked_file", value=str(picked_file))
+    return str(picked_file)
 
 def split_and_save_data(**context):
     result_path = context["ti"].xcom_pull(key="validation_result_path")
@@ -289,25 +260,23 @@ def split_and_save_data(**context):
     GOOD_DIR.mkdir(parents=True, exist_ok=True)
     BAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _write_chunks(data: pd.DataFrame, dest_dir: Path, prefix: str) -> None:
-        if data.empty:
-            return
-        base_name = file_path.stem
-        for i, start in enumerate(range(0, len(data), SPLIT_CHUNK_SIZE), start=1):
-            chunk = data.iloc[start : start + SPLIT_CHUNK_SIZE]
-            dest = dest_dir / f"{prefix}{base_name}_part{i}.csv"
-            chunk.to_csv(dest, index=False)
-            print(f"Saved {prefix.rstrip('_')} chunk with {len(chunk)} rows → {dest}")
-
     if not bad_rows:
-        _write_chunks(df, GOOD_DIR, "GOOD_")
+        dest = GOOD_DIR / file_path.name
+        df.to_csv(dest, index=False)
+        print(f"Saved GOOD data → {dest}")
     elif len(bad_rows) == len(df):
-        _write_chunks(df, BAD_DIR, "BAD_")
+        dest = BAD_DIR / file_path.name
+        df.to_csv(dest, index=False)
+        print(f"Saved BAD data → {dest}")
     else:
         good_df = df.loc[good_rows]
         bad_df = df.loc[bad_rows]
-        _write_chunks(good_df, GOOD_DIR, "GOOD_")
-        _write_chunks(bad_df, BAD_DIR, "BAD_")
+        good_dest = GOOD_DIR / f"GOOD_{file_path.name}"
+        bad_dest = BAD_DIR / f"BAD_{file_path.name}"
+        good_df.to_csv(good_dest, index=False)
+        bad_df.to_csv(bad_dest, index=False)
+        print(f"Saved split GOOD data → {good_dest}")
+        print(f"Saved split BAD data → {bad_dest}")
 
     file_path.unlink(missing_ok=True)
 
