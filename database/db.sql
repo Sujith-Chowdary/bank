@@ -1,0 +1,32 @@
+
+CREATE TABLE IF NOT EXISTS predictions (
+    id SERIAL PRIMARY KEY,
+    customer_id INT,
+    feature_1 FLOAT,
+    feature_2 FLOAT,
+    feature_3 FLOAT,
+    geography VARCHAR(50),
+    gender VARCHAR(10),
+    prediction FLOAT,
+    source VARCHAR(20),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS data_issues (
+    id SERIAL PRIMARY KEY,
+    filename VARCHAR(255),
+    issue_type VARCHAR(50),
+    criticality VARCHAR(20),
+    description TEXT,
+    nb_rows INT,
+    nb_valid INT,
+    nb_invalid INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS processed_files (
+  id SERIAL PRIMARY KEY,
+  filename VARCHAR(512) UNIQUE NOT NULL,
+  processed_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
