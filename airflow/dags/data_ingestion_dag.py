@@ -1,338 +1,216 @@
-from __future__ import annotations
-
-import json
+from airflow import DAG
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from datetime import timedelta
+import pandas as pd
 import os
 import random
-from datetime import timedelta
-from pathlib import Path
-from typing import Dict, List
-
-import pandas as pd
+import json
 import requests
-from airflow import DAG
-from airflow.exceptions import AirflowSkipException
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from airflow.utils.trigger_rule import TriggerRule
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, text
+from pathlib import Path
+import uuid
 
-from database.db import Base, DataQualityIssue, IngestionStatistic
 
+# -------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------
 DATA_DIR = Path("/opt/airflow/Data")
 RAW_DIR = DATA_DIR / "raw"
 GOOD_DIR = DATA_DIR / "good_data"
 BAD_DIR = DATA_DIR / "bad_data"
-REPORT_DIR = DATA_DIR / "reports"
-VALIDATION_DIR = DATA_DIR / "validation_results"
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql+psycopg2://admin:admin@db:5432/defence_db"
-)
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
+REPORTS_DIR = DATA_DIR / "reports"
 
-REQUIRED_COLUMNS = [
-    "RowNumber",
-    "CustomerId",
-    "Surname",
-    "CreditScore",
-    "Geography",
-    "Gender",
-    "Age",
-    "Tenure",
-    "Balance",
-    "NumOfProducts",
-    "HasCrCard",
-    "IsActiveMember",
-    "EstimatedSalary",
-]
-CATEGORICAL_VALUES = {
-    "Geography": {"France", "Spain", "Germany"},
-    "Gender": {"Male", "Female"},
-}
-NUMERIC_BOUNDS = {
-    "CreditScore": (300, 900),
-    "Age": (18, 120),
-    "Tenure": (0, 15),
-    "Balance": (0, None),
-    "NumOfProducts": (1, 4),
-    "EstimatedSalary": (0, None),
+FULL_DATASET = DATA_DIR / "raw_dataset.csv"
+
+DATABASE_URL = "postgresql+psycopg2://admin:admin@db:5432/defence_db"
+
+# Optional → provide Teams webhook URL via environment variable
+TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", None)
+
+
+default_args = {
+    "owner": "team",
+    "depends_on_past": False,
+    "retries": 0,
 }
 
 
-def _load_validation(path: Path) -> Dict:
-    with path.open("r", encoding="utf-8") as fp:
-        return json.load(fp)
+# -------------------------------------------------------------
+# DAG DEFINITION
+# -------------------------------------------------------------
+with DAG(
+    dag_id="data_ingestion_dag",
+    default_args=default_args,
+    schedule="*/2 * * * *",    # every 2 minutes
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["ingestion"],
+):
 
+    # ---------------------------------------------------------
+    # 1️⃣ CREATE EXACTLY ONE 20-ROW SPLIT FOR THIS DAG RUN
+    # ---------------------------------------------------------
+    @task
+    def create_single_split() -> str:
+        RAW_DIR.mkdir(exist_ok=True)
 
-def _persist_validation(path: Path, payload: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+        df = pd.read_csv(FULL_DATASET)
+        total_rows = len(df)
 
+        if total_rows < 20:
+            raise ValueError("Dataset has fewer than 20 rows!")
 
-def _detect_errors(df: pd.DataFrame) -> Dict:
-    errors: Dict[str, List[int]] = {
-        "missing_column": [],
-        "missing_value": [],
-        "unknown_category": [],
-        "out_of_bounds": [],
-        "non_numeric": [],
-    }
-    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing_columns:
-        errors["missing_column"] = list(range(len(df)))
-        return errors, missing_columns
+        start = random.randint(0, total_rows - 20)
+        end = start + 20
 
-    for idx, row in df.iterrows():
-        for col in REQUIRED_COLUMNS:
-            if pd.isna(row[col]):
-                errors["missing_value"].append(idx)
-        for col, allowed in CATEGORICAL_VALUES.items():
-            if col in df.columns and row.get(col) not in allowed:
-                errors["unknown_category"].append(idx)
-        for col, bounds in NUMERIC_BOUNDS.items():
-            if col not in df.columns:
-                continue
-            try:
-                value = float(row[col])
-            except Exception:
-                errors["non_numeric"].append(idx)
-                continue
-            lower, upper = bounds
-            if (lower is not None and value < lower) or (
-                upper is not None and value > upper
-            ):
-                errors["out_of_bounds"].append(idx)
-    return errors, []
+        split_df = df.iloc[start:end]
+        file_path = RAW_DIR / f"raw_split_{uuid.uuid4().hex}.csv"
+        split_df.to_csv(file_path, index=False)
 
+        print(f"Generated 20-row RAW split: {file_path}")
+        return str(file_path)
 
-def _criticality(total_rows: int, invalid_rows: int, missing_columns: List[str]) -> str:
-    if missing_columns or invalid_rows == total_rows:
-        return "high"
-    ratio = invalid_rows / total_rows if total_rows else 0
-    if ratio >= 0.3:
-        return "medium"
-    return "low"
+    # ---------------------------------------------------------
+    # 2️⃣ VALIDATE THE DATA (required by professor)
+    # ---------------------------------------------------------
+    @task
+    def validate_data(file_path: str):
+        df = pd.read_csv(file_path)
+        errors = []
+        criticality = "low"
 
+        # ---- Rule 1: required columns ----
+        required_cols = ["age", "gender", "country", "income"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            errors.append(f"Missing required columns: {missing}")
+            criticality = "high"
 
-def read_data(**context):
-    if not RAW_DIR.exists():
-        raise FileNotFoundError(f"raw-data folder not found: {RAW_DIR}")
+        # ---- Rule 2: missing values ----
+        if df.isnull().any().any():
+            errors.append("Missing values detected.")
+            criticality = "medium"
 
-    files = list(RAW_DIR.glob("*.csv"))
-    if not files:
-        raise AirflowSkipException("No raw files to ingest")
+        # ---- Rule 3: invalid values ----
+        if "age" in df.columns and (df["age"] < 0).any():
+            errors.append("Negative age values detected.")
+            criticality = "high"
 
-    picked_file = random.choice(files)
-    context["ti"].xcom_push(key="picked_file", value=str(picked_file))
-    return str(picked_file)
+        if "gender" in df.columns and not df["gender"].isin(["male", "female"]).all():
+            errors.append("Unexpected gender values.")
+            criticality = "high"
 
+        if "country" in df.columns:
+            allowed = ["China", "India", "Lebanon"]
+            if not df["country"].isin(allowed).all():
+                errors.append("Unknown country values found.")
+                criticality = "medium"
 
-def validate_data(**context):
-    picked = context["ti"].xcom_pull(key="picked_file")
-    if not picked:
-        raise AirflowSkipException("No file picked for validation")
+        result = {
+            "file_path": file_path,
+            "errors": errors,
+            "criticality": criticality,
+            "valid_rows": int(df.dropna().shape[0]),
+            "invalid_rows": int(df.isnull().any(axis=1).sum()),
+        }
 
-    file_path = Path(picked)
-    df = pd.read_csv(file_path)
-    errors, missing_columns = _detect_errors(df)
-    invalid_indices = sorted({idx for rows in errors.values() for idx in rows})
-    total_rows = len(df)
-    invalid_rows = len(invalid_indices)
-    valid_rows = max(total_rows - invalid_rows, 0)
-    crit = _criticality(total_rows, invalid_rows, missing_columns)
-    errors_by_type = {k: len(set(v)) for k, v in errors.items() if v}
+        print("Validation:", result)
+        return result
 
-    report_path = REPORT_DIR / f"report_{file_path.stem}.html"
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_html = f"""
-    <html><body>
-    <h2>Data validation report for {file_path.name}</h2>
-    <p><strong>Criticality:</strong> {crit}</p>
-    <p><strong>Total rows:</strong> {total_rows} — Valid: {valid_rows} / Invalid: {invalid_rows}</p>
-    <h3>Error summary</h3>
-    <ul>
-        {''.join([f'<li>{err}: {count}</li>' for err, count in errors_by_type.items()]) or '<li>No issues found</li>'}
-    </ul>
-    <h3>Missing columns</h3>
-    <p>{', '.join(missing_columns) if missing_columns else 'None'}</p>
-    </body></html>
-    """
-    report_path.write_text(report_html, encoding="utf-8")
+    # ---------------------------------------------------------
+    # 3️⃣ SAVE INGESTION STATISTICS TO DATABASE
+    # ---------------------------------------------------------
+    @task
+    def save_statistics(validation):
+        engine = create_engine(DATABASE_URL)
 
-    validation_payload = {
-        "file_name": file_path.name,
-        "file_path": str(file_path),
-        "total_rows": total_rows,
-        "valid_rows": valid_rows,
-        "invalid_rows": invalid_rows,
-        "errors_by_type": errors_by_type,
-        "criticality": crit,
-        "invalid_indices": invalid_indices,
-        "missing_columns": missing_columns,
-        "report_path": str(report_path),
-    }
+        stats = {
+            "file_name": Path(validation["file_path"]).name,
+            "nb_rows": int(validation["valid_rows"] + validation["invalid_rows"]),
+            "nb_valid_rows": int(validation["valid_rows"]),
+            "nb_invalid_rows": int(validation["invalid_rows"]),
+            "criticality": validation["criticality"],
+            "errors_json": json.dumps(validation["errors"]),
+        }
 
-    result_path = VALIDATION_DIR / f"validation_{file_path.stem}.json"
-    _persist_validation(result_path, validation_payload)
-    context["ti"].xcom_push(key="validation_result_path", value=str(result_path))
-    return validation_payload
-
-
-def save_statistics(**context):
-    result_path = context["ti"].xcom_pull(key="validation_result_path")
-    if not result_path:
-        raise AirflowSkipException("No validation results to persist")
-    result = _load_validation(Path(result_path))
-
-    engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-    Base.metadata.create_all(bind=engine)
-    session = SessionLocal()
-    try:
-        stat = IngestionStatistic(
-            file_name=result["file_name"],
-            total_rows=result["total_rows"],
-            valid_rows=result["valid_rows"],
-            invalid_rows=result["invalid_rows"],
-            criticality=result["criticality"],
-            report_path=result.get("report_path"),
-        )
-        session.add(stat)
-        session.flush()
-
-        for error_type, count in result.get("errors_by_type", {}).items():
-            session.add(
-                DataQualityIssue(
-                    ingestion_id=stat.id,
-                    error_type=error_type,
-                    occurrences=count,
-                    criticality=result["criticality"],
-                )
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO ingestion_statistics
+                    (file_name, nb_rows, nb_valid_rows, nb_invalid_rows, criticality, errors_json)
+                    VALUES (:file_name, :nb_rows, :nb_valid_rows, :nb_invalid_rows, :criticality, :errors_json)
+                """),
+                stats,
             )
-        session.commit()
-    finally:
-        session.close()
 
+        print("Saved statistics:", stats)
 
-def send_alerts(**context):
-    result_path = context["ti"].xcom_pull(key="validation_result_path")
-    if not result_path:
-        raise AirflowSkipException("No validation results for alerting")
-    result = _load_validation(Path(result_path))
-    message = {
-        "text": (
-            f"Data ingestion validation completed for {result['file_name']} — "
-            f"Criticality: {result['criticality']} — "
-            f"Invalid rows: {result['invalid_rows']}/{result['total_rows']}. "
-            f"Report: {result['report_path']}"
-        )
-    }
-    print(f"Teams alert payload: {message}")
-    if TEAMS_WEBHOOK_URL:
-        try:
-            resp = requests.post(TEAMS_WEBHOOK_URL, json=message, timeout=10)
-            resp.raise_for_status()
-        except Exception as exc:
-            print(f"Failed to send Teams notification: {exc}")
+    # ---------------------------------------------------------
+    # 4️⃣ SEND TEAMS ALERT & GENERATE HTML REPORT
+    # ---------------------------------------------------------
+    @task
+    def send_alerts(validation):
+        REPORTS_DIR.mkdir(exist_ok=True)
+        report_path = REPORTS_DIR / f"{uuid.uuid4().hex}_report.html"
 
-    picked_file = random.choice(files)
-    context["ti"].xcom_push(key="picked_file", value=str(picked_file))
-    return str(picked_file)
+        html = f"""
+        <h1>Data Validation Report</h1>
+        <p><b>File:</b> {validation['file_path']}</p>
+        <p><b>Criticality:</b> {validation['criticality']}</p>
+        <p><b>Errors:</b></p>
+        <ul>
+            {''.join(f'<li>{e}</li>' for e in validation['errors'])}
+        </ul>
+        """
+        report_path.write_text(html)
 
-def split_and_save_data(**context):
-    result_path = context["ti"].xcom_pull(key="validation_result_path")
-    if not result_path:
-        raise AirflowSkipException("No validation results to split data")
-    result = _load_validation(Path(result_path))
-    file_path = Path(result["file_path"])
-    if not file_path.exists():
-        raise AirflowSkipException(f"File missing for splitting: {file_path}")
+        # Optional Teams alert
+        if TEAMS_WEBHOOK:
+            msg = {
+                "text": (
+                    f"⚠ Data Alert ({validation['criticality']})\n"
+                    f"Errors: {validation['errors']}\n"
+                    f"Report: {report_path}"
+                )
+            }
+            requests.post(TEAMS_WEBHOOK, json=msg)
 
-    df = pd.read_csv(file_path)
-    invalid_indices = set(result.get("invalid_indices", []))
-    if result.get("missing_columns"):
-        invalid_indices = set(range(len(df)))
+        print(f"Report created: {report_path}")
+        return str(report_path)
 
-    good_rows = [i for i in range(len(df)) if i not in invalid_indices]
-    bad_rows = list(invalid_indices)
+    # ---------------------------------------------------------
+    # 5️⃣ SPLIT INTO GOOD/BAD DATA AND SAVE TO FOLDERS
+    # ---------------------------------------------------------
+    @task
+    def split_and_save(validation):
+        GOOD_DIR.mkdir(exist_ok=True)
+        BAD_DIR.mkdir(exist_ok=True)
 
-    GOOD_DIR.mkdir(parents=True, exist_ok=True)
-    BAD_DIR.mkdir(parents=True, exist_ok=True)
+        df = pd.read_csv(validation["file_path"])
+        file_name = Path(validation["file_path"]).name
 
-    if not bad_rows:
-        dest = GOOD_DIR / file_path.name
-        df.to_csv(dest, index=False)
-        print(f"Saved GOOD data → {dest}")
-    elif len(bad_rows) == len(df):
-        dest = BAD_DIR / file_path.name
-        df.to_csv(dest, index=False)
-        print(f"Saved BAD data → {dest}")
-    else:
-        good_df = df.loc[good_rows]
-        bad_df = df.loc[bad_rows]
-        good_dest = GOOD_DIR / f"GOOD_{file_path.name}"
-        bad_dest = BAD_DIR / f"BAD_{file_path.name}"
-        good_df.to_csv(good_dest, index=False)
-        bad_df.to_csv(bad_dest, index=False)
-        print(f"Saved split GOOD data → {good_dest}")
-        print(f"Saved split BAD data → {bad_dest}")
+        good_df = df.dropna()
+        bad_df = df[df.isnull().any(axis=1)]
 
-    file_path.unlink(missing_ok=True)
+        if bad_df.empty:
+            good_df.to_csv(GOOD_DIR / file_name, index=False)
+        elif good_df.empty:
+            bad_df.to_csv(BAD_DIR / file_name, index=False)
+        else:
+            good_df.to_csv(GOOD_DIR / file_name, index=False)
+            bad_df.to_csv(BAD_DIR / f"BAD_{file_name}", index=False)
 
+        os.remove(validation["file_path"])
+        print(f"Removed RAW file: {validation['file_path']}")
 
-def build_dag():
-    default_args = {
-        "owner": "team",
-        "depends_on_past": False,
-        "retries": 0,
-        "retry_delay": timedelta(minutes=1),
-    }
+    # ---------------------------------------------------------
+    # DAG FLOW
+    # ---------------------------------------------------------
+    raw_file = create_single_split()
+    validation = validate_data(raw_file)
 
-    with DAG(
-        dag_id="data_ingestion_dag",
-        default_args=default_args,
-        schedule_interval="*/1 * * * *",
-        start_date=days_ago(1),
-        catchup=False,
-        tags=["ingestion", "validation"],
-    ) as dag:
-        read_task = PythonOperator(
-            task_id="read_data",
-            python_callable=read_data,
-            provide_context=True,
-        )
-
-        validate_task = PythonOperator(
-            task_id="validate_data",
-            python_callable=validate_data,
-            provide_context=True,
-        )
-
-        save_statistics_task = PythonOperator(
-            task_id="save_statistics",
-            python_callable=save_statistics,
-            provide_context=True,
-            trigger_rule=TriggerRule.ALL_SUCCESS,
-        )
-
-        send_alerts_task = PythonOperator(
-            task_id="send_alerts",
-            python_callable=send_alerts,
-            provide_context=True,
-            trigger_rule=TriggerRule.ALL_SUCCESS,
-        )
-
-        split_and_save_task = PythonOperator(
-            task_id="split_and_save_data",
-            python_callable=split_and_save_data,
-            provide_context=True,
-            trigger_rule=TriggerRule.ALL_SUCCESS,
-        )
-
-        read_task >> validate_task >> [save_statistics_task, send_alerts_task, split_and_save_task]
-
-    return dag
-
-
-dag = build_dag()
+    # Run these 3 tasks in parallel
+    save_statistics(validation)
+    send_alerts(validation)
+    split_and_save(validation)
