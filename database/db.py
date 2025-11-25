@@ -1,6 +1,14 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, Float, String, TIMESTAMP
+from sqlalchemy import (
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    TIMESTAMP,
+    create_engine,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -29,4 +37,30 @@ class Prediction(Base):
     is_active_member = Column(Integer)
     estimated_salary = Column(Float)
     prediction = Column(Integer)
-    created_at = Column(TIMESTAMP, default=datetime.now)  # function, not value
+    source = Column(String, default="webapp")
+    source_file = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+
+class IngestionStatistic(Base):
+    __tablename__ = "ingestion_statistics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_name = Column(String, nullable=False)
+    total_rows = Column(Integer, nullable=False)
+    valid_rows = Column(Integer, nullable=False)
+    invalid_rows = Column(Integer, nullable=False)
+    criticality = Column(String, nullable=False)
+    report_path = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow, nullable=False)
+
+
+class DataQualityIssue(Base):
+    __tablename__ = "data_quality_issues"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ingestion_id = Column(Integer, ForeignKey("ingestion_statistics.id"))
+    error_type = Column(String, nullable=False)
+    occurrences = Column(Integer, nullable=False)
+    criticality = Column(String, nullable=False)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow, nullable=False)
