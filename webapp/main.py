@@ -51,6 +51,10 @@ if choice == "Single Prediction":
             response.raise_for_status()
             result = response.json()
 
+            display_row = payload.copy()
+            display_row["Prediction"] = result.get("prediction_label", "")
+            display_row["RawPrediction"] = result.get("prediction")
+
             if "prediction_label" in result:
                 if result.get("prediction") == 1:
                     st.error(f"🚨 {result['prediction_label']}")
@@ -59,11 +63,16 @@ if choice == "Single Prediction":
             else:
                 st.info(f"Prediction: {result.get('prediction')}")
 
+            st.dataframe(pd.DataFrame([display_row]))
+
         except Exception as e:
             st.error(f"API call failed: {e}")
 
 elif choice == "Batch Prediction":
     st.header("Upload CSV for Batch Predictions")
+    st.caption(
+        "CSV must include the same feature columns as the single prediction form (CreditScore, Geography, Gender, Age, Tenure, Balance, NumOfProducts, HasCrCard, IsActiveMember, EstimatedSalary)."
+    )
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
@@ -99,9 +108,15 @@ elif choice == "Batch Prediction":
 elif choice == "Past Predictions":
     st.header("View Past Predictions from DB")
 
-    source_filter = st.selectbox(
-        "Prediction source", ["all", "webapp", "scheduled"], index=0
+    source_options = {
+        "All": "all",
+        "Webapp": "webapp",
+        "Scheduled predictions": "scheduled",
+    }
+    selected_source_label = st.selectbox(
+        "Prediction source (stored metadata)", list(source_options.keys()), index=0
     )
+    source_filter = source_options[selected_source_label]
     use_date_filter = st.checkbox("Filter by date range", value=False)
 
     params = {"source": source_filter}
