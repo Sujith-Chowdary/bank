@@ -29,7 +29,7 @@ DATABASE_URL = os.environ.get(
 CHUNK_SIZE = 500
 
 
-# ------------ Helper: Get processed files ------------
+# ----------- Helper: Get processed files ------------
 def _get_processed_files():
     engine = create_engine(DATABASE_URL)
     try:
