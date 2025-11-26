@@ -8,9 +8,18 @@ import random
 import json
 import requests
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 from pathlib import Path
 import uuid
+from typing import Dict
 
+# Import your database models
+from database.db import (
+    Base,
+    SessionLocal,
+    engine,
+    IngestionStatistic,
+)
 
 # -------------------------------------------------------------
 # CONFIG
@@ -24,37 +33,13 @@ REPORTS_DIR = DATA_DIR / "reports"
 FULL_DATASET = DATA_DIR / "raw_dataset.csv"
 
 DATABASE_URL = "postgresql+psycopg2://admin:admin@db:5432/defence_db"
-
-# Optional → provide Teams webhook URL via environment variable
 TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", None)
-
 
 default_args = {
     "owner": "team",
     "depends_on_past": False,
     "retries": 0,
 }
-NUMERIC_BOUNDS = {
-    "CreditScore": (300, 900),
-    "Age": (18, 120),
-    "Tenure": (0, 15),
-    "Balance": (0, None),
-    "NumOfProducts": (1, 4),
-    "EstimatedSalary": (0, None),
-}
-
-
-def _load_validation(path: Path) -> Dict:
-    with path.open("r", encoding="utf-8") as fp:
-        return json.load(fp)
-
-
-def _persist_validation(path: Path, payload: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
-
-
 
 # -------------------------------------------------------------
 # DAG DEFINITION
@@ -62,14 +47,14 @@ def _persist_validation(path: Path, payload: Dict) -> None:
 with DAG(
     dag_id="data_ingestion_dag",
     default_args=default_args,
-    schedule="*/2 * * * *",    # every 2 minutes
+    schedule="*/2 * * * *",  # every 2 minutes
     start_date=days_ago(1),
     catchup=False,
     tags=["ingestion"],
 ):
 
     # ---------------------------------------------------------
-    # 1️⃣ CREATE EXACTLY ONE 20-ROW SPLIT FOR THIS DAG RUN
+    # 1️⃣ CREATE EXACTLY ONE 20-ROW SPLIT PER RUN
     # ---------------------------------------------------------
     @task
     def create_single_split() -> str:
@@ -92,7 +77,7 @@ with DAG(
         return str(file_path)
 
     # ---------------------------------------------------------
-    # 2️⃣ VALIDATE THE DATA (required by professor)
+    # 2️⃣ VALIDATE THE DATA
     # ---------------------------------------------------------
     @task
     def validate_data(file_path: str):
@@ -100,21 +85,21 @@ with DAG(
         errors = []
         criticality = "low"
 
-        # ---- Rule 1: required columns ----
+        # Required columns
         required_cols = ["age", "gender", "country", "income"]
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
             errors.append(f"Missing required columns: {missing}")
             criticality = "high"
 
-        # ---- Rule 2: missing values ----
+        # Missing values
         if df.isnull().any().any():
             errors.append("Missing values detected.")
             criticality = "medium"
 
-        # ---- Rule 3: invalid values ----
+        # Invalid values
         if "age" in df.columns and (df["age"] < 0).any():
-            errors.append("Negative age values detected.")
+            errors.append("Negative age detected.")
             criticality = "high"
 
         if "gender" in df.columns and not df["gender"].isin(["male", "female"]).all():
@@ -139,35 +124,46 @@ with DAG(
         return result
 
     # ---------------------------------------------------------
-    # 3️⃣ SAVE INGESTION STATISTICS TO DATABASE
+    # 3️⃣ SAVE STATISTICS TO DATABASE (FIXED)
     # ---------------------------------------------------------
     @task
     def save_statistics(validation):
-        engine = create_engine(DATABASE_URL)
+        # Ensure tables exist
+        Base.metadata.create_all(bind=engine)
 
-        stats = {
-            "file_name": Path(validation["file_path"]).name,
-            "nb_rows": int(validation["valid_rows"] + validation["invalid_rows"]),
-            "nb_valid_rows": int(validation["valid_rows"]),
-            "nb_invalid_rows": int(validation["invalid_rows"]),
-            "criticality": validation["criticality"],
-            "errors_json": json.dumps(validation["errors"]),
-        }
+        session = SessionLocal()
+        try:
+            total_rows = validation["valid_rows"] + validation["invalid_rows"]
 
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO ingestion_statistics
-                    (file_name, nb_rows, nb_valid_rows, nb_invalid_rows, criticality, errors_json)
-                    VALUES (:file_name, :nb_rows, :nb_valid_rows, :nb_invalid_rows, :criticality, :errors_json)
-                """),
-                stats,
+            stat = IngestionStatistic(
+                file_name=Path(validation["file_path"]).name,
+                total_rows=total_rows,
+                valid_rows=validation["valid_rows"],
+                invalid_rows=validation["invalid_rows"],
+                criticality=validation["criticality"],
+                report_path=None,  # updated in send_alerts if needed
             )
 
-        print("Saved statistics:", stats)
+            session.add(stat)
+            session.commit()
+
+            print("✔ Saved ingestion statistics:", {
+                "file_name": stat.file_name,
+                "total_rows": stat.total_rows,
+                "valid_rows": stat.valid_rows,
+                "invalid_rows": stat.invalid_rows,
+                "criticality": stat.criticality,
+            })
+
+        except Exception as e:
+            session.rollback()
+            print("❌ Error saving ingestion statistics:", e)
+            raise
+        finally:
+            session.close()
 
     # ---------------------------------------------------------
-    # 4️⃣ SEND TEAMS ALERT & GENERATE HTML REPORT
+    # 4️⃣ SEND TEAMS ALERT & GENERATE REPORT
     # ---------------------------------------------------------
     @task
     def send_alerts(validation):
@@ -185,7 +181,6 @@ with DAG(
         """
         report_path.write_text(html)
 
-        # Optional Teams alert
         if TEAMS_WEBHOOK:
             msg = {
                 "text": (
@@ -200,7 +195,7 @@ with DAG(
         return str(report_path)
 
     # ---------------------------------------------------------
-    # 5️⃣ SPLIT INTO GOOD/BAD DATA AND SAVE TO FOLDERS
+    # 5️⃣ SPLIT INTO GOOD/BAD DATA
     # ---------------------------------------------------------
     @task
     def split_and_save(validation):
@@ -210,6 +205,8 @@ with DAG(
         df = pd.read_csv(validation["file_path"])
         file_name = Path(validation["file_path"]).name
 
+        good_df = df.dropna()
+        bad_df = df[df.isnull().any(axis=1)]
 
         if bad_df.empty:
             good_df.to_csv(GOOD_DIR / file_name, index=False)
@@ -228,7 +225,6 @@ with DAG(
     raw_file = create_single_split()
     validation = validate_data(raw_file)
 
-    # Run these 3 tasks in parallel
     save_statistics(validation)
     send_alerts(validation)
     split_and_save(validation)

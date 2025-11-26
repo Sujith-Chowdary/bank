@@ -10,21 +10,26 @@ from airflow import DAG
 from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
-from airflow.models import DagRun
-from airflow.utils.state import State
 from sqlalchemy import create_engine
 
+
+# ------------ CONFIG ------------
 GOOD_DIR = Path("/opt/airflow/Data/good_data")
-FASTAPI_URL = os.environ.get("FASTAPI_URL", "http://fastapi:8000/predict")
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+psycopg2://admin:admin@db:5432/defence_db"
+
+FASTAPI_URL = os.environ.get(
+    "FASTAPI_URL",
+    "http://fastapi:8000/predict"
 )
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://admin:admin@db:5432/defence_db"
+)
+
 CHUNK_SIZE = 500
 
 
-# ----------------------------------------
-# Helper: Read list of already-processed files
-# ----------------------------------------
+# ------------ Helper: Get processed files ------------
 def _get_processed_files():
     engine = create_engine(DATABASE_URL)
     try:
@@ -34,54 +39,42 @@ def _get_processed_files():
         return set()
 
 
-# ----------------------------------------
-# Task 1 — Check for new data
-# ----------------------------------------
+# ------------ Task 1: Check for New Data ------------
 def check_for_new_data(**context):
-    dag_run: DagRun = context["dag_run"]
-    ti = context["ti"]
+    """
+    REQUIREMENT:
+    - If no new files → mark *entire DAG run* as SKIPPED.
+    """
+    all_files = [f.name for f in GOOD_DIR.glob("*.csv")]
+    processed = _get_processed_files()
 
-    all_files = [f for f in GOOD_DIR.glob("*.csv")]
-    processed_files = _get_processed_files()
+    new_files = [f for f in all_files if f not in processed]
 
-    new_files = [f.name for f in all_files if f.name not in processed_files]
-
-    # ----------------------------------------------------------
-    # REQUIRED BY ASSIGNMENT:
-    # → If no new files → mark DAG run as "skipped"
-    # ----------------------------------------------------------
     if not new_files:
-        # store pseudo-state so UI/teacher can verify
-        ti.xcom_push(key="dag_run_status", value="SKIPPED_NO_NEW_FILES")
+        # Skip ENTIRE DAG RUN
+        raise AirflowSkipException("No new files → skipping full DAG run.")
 
-        # skip entire DAG (all downstream tasks)
-        raise AirflowSkipException("No new ingested files — skipping entire DAG run.")
-
-    # otherwise pass list forward
-    ti.xcom_push(key="new_files", value=new_files)
-    ti.xcom_push(key="dag_run_status", value="WILL_RUN")
-
+    # Send new files list to next task
+    context["ti"].xcom_push(key="new_files", value=new_files)
     return new_files
 
 
-# ----------------------------------------
-# Task 2 — Run predictions
-# ----------------------------------------
+# ------------ Task 2: Make Predictions ------------
 def make_predictions(**context):
-    ti = context["ti"]
-    new_files = ti.xcom_pull(key="new_files")
-
+    new_files = context["ti"].xcom_pull(key="new_files")
     if not new_files:
-        raise AirflowSkipException("No files passed for prediction")
+        raise AirflowSkipException("No files to process.")
+
+    engine = create_engine(DATABASE_URL)
 
     for file in new_files:
         file_path = GOOD_DIR / file
 
         if not file_path.exists():
-            print(f"WARNING: file not found: {file_path}")
+            print(f"Missing file: {file_path}")
             continue
 
-        # read in chunks
+        # Read file in chunks
         for chunk in pd.read_csv(file_path, chunksize=CHUNK_SIZE):
             payload = chunk.to_dict(orient="records")
 
@@ -90,36 +83,20 @@ def make_predictions(**context):
                     FASTAPI_URL,
                     json=payload,
                     params={"source": "scheduled", "source_file": file},
-                    timeout=60,
+                    timeout=30,
                 )
                 response.raise_for_status()
+
+                preds = response.json()
+                print(f"Processed {len(chunk)} rows for file: {file}")
+
             except Exception as exc:
-                print(f"FastAPI error for {file}: {exc}")
-                continue
-
-            result = response.json()
-
-            if isinstance(result, dict) and "predictions" in result:
-                predictions = result["predictions"]
-            elif isinstance(result, list):
-                predictions = result
-            else:
-                predictions = [result]
-
-            print(
-                f"[{file}] processed {len(chunk)} rows → {len(predictions)} predictions"
-            )
+                print(f"Prediction failed for {file}: {exc}")
 
 
-# ----------------------------------------
-# DAG Definition
-# ----------------------------------------
+# ------------ DAG Definition ------------
 def build_dag():
-    default_args = {
-        "owner": "airflow",
-        "depends_on_past": False,
-        "retries": 0,
-    }
+    default_args = {"owner": "airflow", "retries": 0}
 
     with DAG(
         "prediction_dag",
