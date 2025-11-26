@@ -7,11 +7,11 @@ import os
 import random
 import json
 import requests
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
 from pathlib import Path
 import uuid
-from typing import Dict
+from typing import Dict, List
+
+import great_expectations as ge
 
 # Import your database models
 from database.db import (
@@ -25,12 +25,11 @@ from database.db import (
 # CONFIG
 # -------------------------------------------------------------
 DATA_DIR = Path("/opt/airflow/Data")
-RAW_DIR = DATA_DIR / "raw"
+RAW_DATA_SOURCE = DATA_DIR / "raw-data"
+LEGACY_RAW_DIR = DATA_DIR / "raw"
 GOOD_DIR = DATA_DIR / "good_data"
 BAD_DIR = DATA_DIR / "bad_data"
 REPORTS_DIR = DATA_DIR / "reports"
-
-FULL_DATASET = DATA_DIR / "raw_dataset.csv"
 
 DATABASE_URL = "postgresql+psycopg2://admin:admin@db:5432/defence_db"
 TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", None)
@@ -47,33 +46,33 @@ default_args = {
 with DAG(
     dag_id="data_ingestion_dag",
     default_args=default_args,
-    schedule="*/2 * * * *",  # every 2 minutes
+    schedule="*/1 * * * *",  # every minute
     start_date=days_ago(1),
     catchup=False,
     tags=["ingestion"],
 ):
 
     # ---------------------------------------------------------
-    # 1️⃣ CREATE EXACTLY ONE 20-ROW SPLIT PER RUN
+    # 1️⃣ PICK A RANDOM RAW FILE EACH RUN
     # ---------------------------------------------------------
     @task
-    def create_single_split() -> str:
-        RAW_DIR.mkdir(exist_ok=True)
+    def pick_random_raw_file() -> str:
+        """Pick a random CSV from raw-data and return its path."""
 
-        df = pd.read_csv(FULL_DATASET)
-        total_rows = len(df)
+        RAW_DATA_SOURCE.mkdir(exist_ok=True)
 
-        if total_rows < 20:
-            raise ValueError("Dataset has fewer than 20 rows!")
+        available_files = list(RAW_DATA_SOURCE.glob("*.csv"))
 
-        start = random.randint(0, total_rows - 20)
-        end = start + 20
+        if not available_files:
+            available_files = list(LEGACY_RAW_DIR.glob("*.csv"))
 
-        split_df = df.iloc[start:end]
-        file_path = RAW_DIR / f"raw_split_{uuid.uuid4().hex}.csv"
-        split_df.to_csv(file_path, index=False)
+        if not available_files:
+            raise FileNotFoundError(
+                f"No CSV files found in {RAW_DATA_SOURCE} or {LEGACY_RAW_DIR}. Populate raw-data before running."
+            )
 
-        print(f"Generated 20-row RAW split: {file_path}")
+        file_path = random.choice(available_files)
+        print(f"Selected RAW file for validation: {file_path}")
         return str(file_path)
 
     # ---------------------------------------------------------
@@ -82,45 +81,138 @@ with DAG(
     @task
     def validate_data(file_path: str):
         df = pd.read_csv(file_path)
-        errors = []
-        criticality = "low"
+        ge_df = ge.from_pandas(df)
 
-        # Required columns
+        errors: List[Dict] = []
+        expectation_results: List[Dict] = []
+        severity_order = {"low": 1, "medium": 2, "high": 3}
+        criticality_level = "low"
+
+        def track_result(name: str, severity: str, description: str, expectation_func):
+            nonlocal criticality_level
+            try:
+                result = expectation_func()
+            except Exception as exc:
+                result = {"success": False, "exception": str(exc)}
+
+            expectation_results.append(
+                {
+                    "check": name,
+                    "description": description,
+                    "severity": severity,
+                    "result": result,
+                }
+            )
+
+            if not result.get("success", False):
+                errors.append(
+                    {
+                        "type": name,
+                        "message": description,
+                        "criticality": severity,
+                        "details": result,
+                    }
+                )
+                if severity_order[severity] > severity_order[criticality_level]:
+                    criticality_level = severity
+
+        # 1) Required columns
         required_cols = ["age", "gender", "country", "income"]
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            errors.append(f"Missing required columns: {missing}")
-            criticality = "high"
+        for col in required_cols:
+            track_result(
+                name="missing_required_column",
+                severity="high",
+                description=f"Column '{col}' must exist.",
+                expectation_func=lambda col=col: ge_df.expect_column_to_exist(col),
+            )
 
-        # Missing values
-        if df.isnull().any().any():
-            errors.append("Missing values detected.")
-            criticality = "medium"
+        # Only run further checks if required columns exist
+        present_cols = all(col in df.columns for col in required_cols)
 
-        # Invalid values
-        if "age" in df.columns and (df["age"] < 0).any():
-            errors.append("Negative age detected.")
-            criticality = "high"
+        if present_cols:
+            # 2) Missing values
+            for col in required_cols:
+                track_result(
+                    name="missing_values",
+                    severity="medium",
+                    description=f"Column '{col}' should not contain nulls.",
+                    expectation_func=lambda col=col: ge_df.expect_column_values_to_not_be_null(col),
+                )
 
-        if "gender" in df.columns and not df["gender"].isin(["male", "female"]).all():
-            errors.append("Unexpected gender values.")
-            criticality = "high"
+            # 3) Age numeric
+            track_result(
+                name="age_not_numeric",
+                severity="high",
+                description="Age must be numeric (int or float).",
+                expectation_func=lambda: ge_df.expect_column_values_to_be_in_type_list(
+                    "age", ["int64", "float64", "int32", "float32"]
+                ),
+            )
 
-        if "country" in df.columns:
-            allowed = ["China", "India", "Lebanon"]
-            if not df["country"].isin(allowed).all():
-                errors.append("Unknown country values found.")
-                criticality = "medium"
+            # 4) Age range
+            track_result(
+                name="age_out_of_range",
+                severity="high",
+                description="Age must be between 0 and 120.",
+                expectation_func=lambda: ge_df.expect_column_values_to_be_between(
+                    "age", min_value=0, max_value=120
+                ),
+            )
+
+            # 5) Gender values
+            track_result(
+                name="gender_unexpected",
+                severity="high",
+                description="Gender must be 'male' or 'female'.",
+                expectation_func=lambda: ge_df.expect_column_values_to_be_in_set(
+                    "gender", ["male", "female"]
+                ),
+            )
+
+            # 6) Country allowed list
+            track_result(
+                name="country_unexpected",
+                severity="medium",
+                description="Country must be one of China, India, or Lebanon.",
+                expectation_func=lambda: ge_df.expect_column_values_to_be_in_set(
+                    "country", ["China", "India", "Lebanon"]
+                ),
+            )
+
+            # 7) Income positive and reasonable
+            track_result(
+                name="income_not_positive",
+                severity="high",
+                description="Income must be positive and below 1,000,000.",
+                expectation_func=lambda: ge_df.expect_column_values_to_be_between(
+                    "income", min_value=0, max_value=1_000_000
+                ),
+            )
+
+            # 8) Duplicate rows
+            track_result(
+                name="duplicate_rows",
+                severity="medium",
+                description="Dataset should not contain duplicate rows.",
+                expectation_func=lambda: {
+                    "success": not df.duplicated().any(),
+                    "result": {"duplicate_count": int(df.duplicated().sum())},
+                },
+            )
+
+        invalid_rows = int(df.isnull().any(axis=1).sum())
+        valid_rows = int(len(df) - invalid_rows)
 
         result = {
             "file_path": file_path,
             "errors": errors,
-            "criticality": criticality,
-            "valid_rows": int(df.dropna().shape[0]),
-            "invalid_rows": int(df.isnull().any(axis=1).sum()),
+            "criticality": criticality_level,
+            "valid_rows": valid_rows,
+            "invalid_rows": invalid_rows,
+            "expectations": expectation_results,
         }
 
-        print("Validation:", result)
+        print("Validation:", json.dumps(result, indent=2))
         return result
 
     # ---------------------------------------------------------
@@ -170,22 +262,42 @@ with DAG(
         REPORTS_DIR.mkdir(exist_ok=True)
         report_path = REPORTS_DIR / f"{uuid.uuid4().hex}_report.html"
 
+        error_list_items = "".join(
+            f"<li><b>{e['type']}</b> ({e['criticality']}): {e['message']}</li>"
+            for e in validation["errors"]
+        )
+        expectation_rows = "".join(
+            f"<tr><td>{res['check']}</td><td>{res['severity']}</td>"
+            f"<td>{res['description']}</td><td>{res['result'].get('success')}</td></tr>"
+            for res in validation["expectations"]
+        )
+
         html = f"""
         <h1>Data Validation Report</h1>
         <p><b>File:</b> {validation['file_path']}</p>
         <p><b>Criticality:</b> {validation['criticality']}</p>
-        <p><b>Errors:</b></p>
-        <ul>
-            {''.join(f'<li>{e}</li>' for e in validation['errors'])}
-        </ul>
+        <h3>Errors ({len(validation['errors'])})</h3>
+        <ul>{error_list_items}</ul>
+        <h3>Expectation Results</h3>
+        <table border="1" cellpadding="5" cellspacing="0">
+            <tr><th>Check</th><th>Severity</th><th>Description</th><th>Success</th></tr>
+            {expectation_rows}
+        </table>
         """
         report_path.write_text(html)
+
+        summary = (
+            f"Criticality: {validation['criticality']} | "
+            f"Valid rows: {validation['valid_rows']} | "
+            f"Invalid rows: {validation['invalid_rows']} | "
+            f"Errors found: {len(validation['errors'])}"
+        )
 
         if TEAMS_WEBHOOK:
             msg = {
                 "text": (
                     f"⚠ Data Alert ({validation['criticality']})\n"
-                    f"Errors: {validation['errors']}\n"
+                    f"{summary}\n"
                     f"Report: {report_path}"
                 )
             }
@@ -216,15 +328,16 @@ with DAG(
             good_df.to_csv(GOOD_DIR / file_name, index=False)
             bad_df.to_csv(BAD_DIR / f"BAD_{file_name}", index=False)
 
-        os.remove(validation["file_path"])
-        print(f"Removed RAW file: {validation['file_path']}")
+        print(f"Preserved RAW file: {validation['file_path']}")
 
     # ---------------------------------------------------------
     # DAG FLOW
     # ---------------------------------------------------------
-    raw_file = create_single_split()
+    raw_file = pick_random_raw_file()
     validation = validate_data(raw_file)
 
-    save_statistics(validation)
-    send_alerts(validation)
-    split_and_save(validation)
+    save_task = save_statistics(validation)
+    alert_task = send_alerts(validation)
+    split_task = split_and_save(validation)
+
+    validation >> [save_task, alert_task, split_task]
