@@ -173,6 +173,7 @@ from typing import List, Optional, Union
 import pandas as pd
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from churn_model import preprocess_and_predict
@@ -190,10 +191,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------
+# ⭐ Auto redirect root URL "/" → "/docs"
+# ---------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse(url="/docs")
 
-# -------------------------------------------------------
-# ✔ Pydantic model for incoming prediction request
-# -------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Pydantic Model
+# ---------------------------------------------------------------------
 class CustomerData(BaseModel):
     CreditScore: float
     Geography: str
@@ -207,9 +215,9 @@ class CustomerData(BaseModel):
     EstimatedSalary: float
 
 
-# -------------------------------------------------------
-# ✔ DB Session Dependency
-# -------------------------------------------------------
+# ---------------------------------------------------------------------
+# DB dependency
+# ---------------------------------------------------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -218,14 +226,9 @@ def get_db():
         db.close()
 
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to the Churn Prediction API"}
-
-
-# -------------------------------------------------------
-# 🚀 PREDICTION ENDPOINT (Single + Batch + CSV-friendly)
-# -------------------------------------------------------
+# ---------------------------------------------------------------------
+# Prediction Endpoint (Single + Batch)
+# ---------------------------------------------------------------------
 @app.post("/predict")
 def predict(
     data: Union[CustomerData, List[CustomerData]] = Body(..., embed=False),
@@ -233,62 +236,44 @@ def predict(
     source_file: Optional[str] = Query(None),
     db=Depends(get_db),
 ):
-    """
-    Handle single or batch predictions.
-    Fixes NaN/Infinity JSON issues.
-    """
-
+    """Single or batch predictions"""
     try:
-        # Normalize to list
         rows = data if isinstance(data, list) else [data]
-
-        # Convert Pydantic → DataFrame
         df = pd.DataFrame([row.dict() for row in rows])
 
-        # -------------------------------------------------------
-        # 🔧 FIX: Clean invalid numeric values that break FastAPI
-        # -------------------------------------------------------
-        df = df.replace([float("inf"), float("-inf")], None)
-        df = df.where(pd.notnull(df), None)
-        df = df.applymap(
-            lambda x: x
-            if isinstance(x, (int, float, str, bool)) or x is None
-            else str(x)
-        )
-        # -------------------------------------------------------
+        # Fix NaN/infinity before prediction
+        df = df.replace({float("nan"): 0, float("inf"): 0, float("-inf"): 0})
 
-        # Run ML prediction
         preds = preprocess_and_predict(df)
 
-        results: List[dict] = []
         timestamp = datetime.utcnow()
+        predictions_list = []
 
-        # Store each row prediction to database
         for row, pred in zip(rows, preds):
-            pred_value = int(pred)
+            prediction_value = int(pred)
 
             db_obj = Prediction(
                 credit_score=row.CreditScore,
                 geography=row.Geography,
                 gender=row.Gender,
-                age=row.Age,
+                age=row.age,
                 tenure=row.Tenure,
                 balance=row.Balance,
                 num_of_products=row.NumOfProducts,
                 has_cr_card=row.HasCrCard,
                 is_active_member=row.IsActiveMember,
                 estimated_salary=row.EstimatedSalary,
-                prediction=pred_value,
+                prediction=prediction_value,
                 source=source,
                 source_file=source_file,
                 created_at=timestamp,
             )
             db.add(db_obj)
 
-            results.append(
+            predictions_list.append(
                 {
-                    "prediction": pred_value,
-                    "prediction_label": "Will churn" if pred_value == 1 else "Will not churn",
+                    "prediction": prediction_value,
+                    "prediction_label": "Will churn" if prediction_value == 1 else "Will not churn",
                     "source": source,
                     "source_file": source_file,
                 }
@@ -296,22 +281,19 @@ def predict(
 
         db.commit()
 
-        # Return single or batch format
-        if len(results) == 1:
-            return results[0]
+        if len(predictions_list) == 1:
+            return predictions_list[0]
 
-        return {"predictions": results, "count": len(results)}
+        return {"predictions": predictions_list, "count": len(predictions_list)}
 
     except Exception as e:
         db.rollback()
-        import traceback
-        print("Prediction error:", traceback.format_exc())
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# -------------------------------------------------------
-# 📜 Retrieve past predictions (for dashboard)
-# -------------------------------------------------------
+# ---------------------------------------------------------------------
+# Past Predictions Endpoint
+# ---------------------------------------------------------------------
 @app.get("/past-predictions")
 def get_past_predictions(
     start_date: Optional[datetime] = Query(None),
