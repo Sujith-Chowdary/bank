@@ -256,7 +256,7 @@ def predict(
                 credit_score=row.CreditScore,
                 geography=row.Geography,
                 gender=row.Gender,
-                age=row.age,
+                age=row.Age,
                 tenure=row.Tenure,
                 balance=row.Balance,
                 num_of_products=row.NumOfProducts,

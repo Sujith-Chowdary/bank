@@ -1,0 +1,6 @@
+RowNumber,CustomerId,Surname,CreditScore,Geography,Gender,Age,Tenure,Balance,NumOfProducts,HasCrCard,IsActiveMember,EstimatedSalary,Exited
+9999.0,15682355.0,Sabbatini,772.0,Germany,Male,42.0,3.0,75075.31,2.0,1.0,0.0,92888.52,1.0
+10000.0,15628319.0,Walker,792.0,France,Female,28.0,4.0,130142.79,1.0,1.0,0.0,38190.78,0.0
+10000.0,15628319.0,Walker,792.0,France,Female,28.0,4.0,130142.79,1.0,1.0,0.0,38190.78,0.0
+,,,,,,,,,,,,,
+10000.0,15628319.0,Walker,792.0,France,Female,28.0,4.0,130142.79,1.0,1.0,0.0,38190.78,0.0

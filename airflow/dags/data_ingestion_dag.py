@@ -61,7 +61,6 @@ with DAG(
             available = list(LEGACY_RAW_DIR.glob("*.csv"))
 
         if not available:
-            # No raw files → skip the DAG run gracefully
             raise AirflowSkipException(
                 f"No CSV files found in {RAW_DATA_SOURCE} or {LEGACY_RAW_DIR}"
             )
@@ -174,7 +173,7 @@ with DAG(
             check(
                 "income_range",
                 "high",
-                "Income must be positive and less than 1,000,000.",
+                "Income must be positive and < 1,000,000.",
                 lambda: ge_df.expect_column_values_to_be_between(
                     "income", 0, 1_000_000
                 ),
@@ -226,7 +225,7 @@ with DAG(
         finally:
             session.close()
 
-    # 4️⃣ GENERATE HTML REPORT + OPTIONAL TEAMS ALERT
+    # 4️⃣ SEND ALERTS
     @task
     def send_alerts(validation):
         REPORTS_DIR.mkdir(exist_ok=True)
@@ -257,33 +256,20 @@ with DAG(
         """
         report_path.write_text(html)
         print(f"Report created: {report_path}")
-
-        if TEAMS_WEBHOOK:
-            summary = (
-                f"Criticality: {validation['criticality']} | "
-                f"Valid rows: {validation['valid_rows']} | "
-                f"Invalid rows: {validation['invalid_rows']} | "
-                f"Errors: {len(validation['errors'])}"
-            )
-            msg = {
-                "text": (
-                    f"⚠ Data Alert ({validation['criticality']})\n"
-                    f"{summary}\n"
-                    f"Report: {report_path}"
-                )
-            }
-            requests.post(TEAMS_WEBHOOK, json=msg)
-
         return str(report_path)
 
-    # 5️⃣ SPLIT INTO GOOD/BAD DATA
+    # 5️⃣ SPLIT + ARCHIVE (UPDATED)
     @task
     def split_and_save(validation):
         GOOD_DIR.mkdir(exist_ok=True)
         BAD_DIR.mkdir(exist_ok=True)
 
-        df = pd.read_csv(validation["file_path"])
-        file_name = Path(validation["file_path"]).name
+        ARCHIVE_DIR = DATA_DIR / "archive_raw"
+        ARCHIVE_DIR.mkdir(exist_ok=True)
+
+        raw_path = Path(validation["file_path"])
+        df = pd.read_csv(raw_path)
+        file_name = raw_path.name
 
         good_df = df.dropna()
         bad_df = df[df.isnull().any(axis=1)]
@@ -297,6 +283,11 @@ with DAG(
             bad_df.to_csv(BAD_DIR / f"BAD_{file_name}", index=False)
 
         print(f"Saved good/bad splits for {file_name}")
+
+        # ARCHIVE RAW FILE
+        archived_path = ARCHIVE_DIR / file_name
+        raw_path.rename(archived_path)
+        print(f"Archived raw file → {archived_path}")
 
     # DAG FLOW
     raw_file = read_data()
