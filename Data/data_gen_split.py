@@ -1,40 +1,91 @@
-# Data/data_gen_split.py
 import pandas as pd
 import os
 import argparse
 import numpy as np
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--dataset_path', type=str, required=True, help='Path to full CSV dataset')
-parser.add_argument('--raw_data_dir', type=str, required=True, help='Folder to save split CSV files')
-parser.add_argument('--num_files', type=int, default=5, help='Number of files to split into')
-args = parser.parse_args()
-
-dataset_path = args.dataset_path
-raw_data_dir = args.raw_data_dir
-num_files = args.num_files
-
-# Make sure dataset exists
-if not os.path.exists(dataset_path):
-    raise FileNotFoundError(f"Dataset not found: {dataset_path}")
-
-# Read dataset
-df = pd.read_csv(dataset_path)
-if df.empty:
-    raise ValueError(f"Dataset is empty: {dataset_path}")
+import random
 
 
-os.makedirs(raw_data_dir, exist_ok=True)
+# ---------------------------------------------------------
+# Inject 7 possible data quality errors safely
+# ---------------------------------------------------------
+def inject_errors(df: pd.DataFrame) -> pd.DataFrame:
 
-# Split dataset
-rows_per_file = int(np.ceil(len(df) / num_files))
+    df = df.copy()
 
-for i in range(num_files):
-    start = i * rows_per_file
-    end = start + rows_per_file
-    split_df = df.iloc[start:end]
-    split_file = os.path.join(raw_data_dir, f'split_{i+1}.csv')
-    split_df.to_csv(split_file, index=False)
-    print(f"Created {split_file} with {len(split_df)} rows")
+    # pick only from existing row range (safe)
+    if len(df) == 0:
+        return df
 
-print("All files created successfully!")
+    safe_index = lambda: random.randint(0, len(df) - 1)
+
+    # 1) Missing values
+    i = safe_index()
+    col = random.choice(df.columns)
+    df.loc[i, col] = None
+
+    # 2) Invalid country
+    if "country" in df.columns:
+        df.loc[safe_index(), "country"] = "France"
+
+    # 3) Invalid gender
+    if "gender" in df.columns:
+        df.loc[safe_index(), "gender"] = "child"
+
+    # 4) Negative age
+    if "age" in df.columns:
+        df.loc[safe_index(), "age"] = -5
+
+    # 5) String in income
+    if "income" in df.columns:
+        df.loc[safe_index(), "income"] = "not_a_number"
+
+    # 6) Drop a required column (simulate missing column error)
+    required_cols = ["age", "gender", "country", "income"]
+    drop_col = random.choice(required_cols)
+    if drop_col in df.columns:
+        df = df.drop(columns=[drop_col])
+
+    # 7) Duplicate a safe row
+    dup_idx = safe_index()
+    df = pd.concat([df, df.iloc[[dup_idx]].copy()], ignore_index=True)
+
+    return df
+
+
+# ---------------------------------------------------------
+# Main splitting function
+# ---------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_path', type=str, required=True)
+    parser.add_argument('--raw_data_dir', type=str, required=True)
+    parser.add_argument('--num_files', type=int, default=5)
+    args = parser.parse_args()
+
+    df = pd.read_csv(args.dataset_path)
+    if df.empty:
+        raise ValueError("Dataset is empty!")
+
+    os.makedirs(args.raw_data_dir, exist_ok=True)
+
+    rows = len(df)
+    rows_per_file = int(np.ceil(rows / args.num_files))
+
+    for i in range(args.num_files):
+        start = i * rows_per_file
+        end = min(start + rows_per_file, rows)
+        split_df = df.iloc[start:end].copy()
+
+        # inject errors safely into each split
+        split_df = inject_errors(split_df)
+
+        out_path = os.path.join(args.raw_data_dir, f"raw_split_{i+1}.csv")
+        split_df.to_csv(out_path, index=False)
+
+        print(f"[OK] Created {out_path} with {len(split_df)} rows")
+
+    print("\nAll files created successfully!")
+
+
+if __name__ == "__main__":
+    main()
